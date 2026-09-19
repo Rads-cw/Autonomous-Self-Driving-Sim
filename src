@@ -1,0 +1,627 @@
+/*
+ * Copyright 1996-2024 Cyberbotics Ltd.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Description:
+ *   Modified autonomous vehicle controller:
+ *   - follow yellow line
+ *   - gently avoid obstacle in front
+ *   - continue following line after obstacle clears
+ *   - slow down at yellow zebra crossing, resume when clear
+ *   - stop completely when a pedestrian is recognized by the camera
+ */
+
+#include <webots/camera.h>
+#include <webots/camera_recognition_object.h>
+#include <webots/device.h>
+#include <webots/display.h>
+#include <webots/gps.h>
+#include <webots/keyboard.h>
+#include <webots/lidar.h>
+#include <webots/robot.h>
+#include <webots/vehicle/driver.h>
+
+#include <math.h>
+#include <stdbool.h>
+#include <stdio.h>
+#include <string.h>
+
+// To be used as array indices
+enum { X, Y, Z };
+
+#define TIME_STEP 50
+#define UNKNOWN 99999.99
+
+// Line-following PID
+#define KP 0.25
+#define KI 0.006
+#define KD 2.0
+
+// Yellow-line angle filter
+#define FILTER_SIZE 3
+
+// Obstacle avoidance tuning
+#define CRUISE_SPEED 45.0
+#define AVOID_SPEED 20.0
+#define LOST_LINE_SPEED 16.0
+
+#define FRONT_HALF_AREA 18
+#define FRONT_OBSTACLE_DIST 18.0
+#define FRONT_CLEAR_DIST 24.0
+
+#define MAX_AVOID_BIAS 0.18
+#define RECOVER_FACTOR 0.82
+#define AVOID_BRAKE 0.20
+#define LOST_LINE_BRAKE 0.35
+
+// Pedestrian recognition tuning
+#define PEDESTRIAN_STOP_BRAKE 1.0
+#define PEDESTRIAN_CENTER_TOLERANCE 0.22
+
+// Feature flags
+static bool enable_collision_avoidance = false;
+static bool enable_display = false;
+static bool has_gps = false;
+static bool has_camera = false;
+
+// PID state
+static bool PID_need_reset = false;
+
+// Camera
+static WbDeviceTag camera;
+static int camera_width = -1;
+static int camera_height = -1;
+static double camera_fov = -1.0;
+
+// SICK LiDAR
+static WbDeviceTag sick;
+static int sick_width = -1;
+static double sick_range = -1.0;
+static double sick_fov = -1.0;
+
+// Speedometer display
+static WbDeviceTag display;
+static int display_width = 0;
+static int display_height = 0;
+static WbImageRef speedometer_image = NULL;
+
+// GPS
+static WbDeviceTag gps;
+static double gps_coords[3] = {0.0, 0.0, 0.0};
+static double gps_speed = 0.0;
+
+// Vehicle state
+static double speed = 0.0;
+static double steering_angle = 0.0;
+static int manual_steering = 0;
+static bool autodrive = true;
+
+// Obstacle avoidance state
+static double avoid_bias = 0.0;
+static int avoid_direction = 0;
+
+void print_help() {
+  printf("You can drive this car!\n");
+  printf("Select the 3D window and then use the cursor keys to:\n");
+  printf("[LEFT]/[RIGHT] - steer\n");
+  printf("[UP]/[DOWN] - accelerate/slow down\n");
+}
+
+void set_autodrive(bool onoff) {
+  if (autodrive == onoff)
+    return;
+
+  autodrive = onoff;
+
+  switch (autodrive) {
+    case false:
+      printf("switching to manual drive...\n");
+      printf("hit [A] to return to auto-drive.\n");
+      break;
+
+    case true:
+      if (has_camera)
+        printf("switching to auto-drive...\n");
+      else
+        printf("impossible to switch auto-drive on without camera...\n");
+      break;
+  }
+}
+
+void set_speed(double kmh) {
+  if (kmh > 250.0)
+    kmh = 250.0;
+  if (kmh < 0.0)
+    kmh = 0.0;
+
+  speed = kmh;
+  wbu_driver_set_cruising_speed(kmh);
+}
+
+void set_steering_angle(double wheel_angle) {
+  if (wheel_angle - steering_angle > 0.1)
+    wheel_angle = steering_angle + 0.1;
+  if (wheel_angle - steering_angle < -0.1)
+    wheel_angle = steering_angle - 0.1;
+
+  steering_angle = wheel_angle;
+
+  if (wheel_angle > 0.5)
+    wheel_angle = 0.5;
+  else if (wheel_angle < -0.5)
+    wheel_angle = -0.5;
+
+  wbu_driver_set_steering_angle(wheel_angle);
+}
+
+void change_manual_steer_angle(int inc) {
+  set_autodrive(false);
+
+  double new_manual_steering = manual_steering + inc;
+  if (new_manual_steering <= 25.0 && new_manual_steering >= -25.0) {
+    manual_steering = new_manual_steering;
+    set_steering_angle(manual_steering * 0.02);
+  }
+
+  if (manual_steering == 0)
+    printf("going straight\n");
+  else
+    printf("turning %.2f rad (%s)\n", steering_angle,
+           steering_angle < 0 ? "left" : "right");
+}
+
+void check_keyboard() {
+  int key = wb_keyboard_get_key();
+
+  switch (key) {
+    case WB_KEYBOARD_UP:
+      set_speed(speed + 5.0);
+      break;
+    case WB_KEYBOARD_DOWN:
+      set_speed(speed - 5.0);
+      break;
+    case WB_KEYBOARD_RIGHT:
+      change_manual_steer_angle(+1);
+      break;
+    case WB_KEYBOARD_LEFT:
+      change_manual_steer_angle(-1);
+      break;
+    case 'A':
+      set_autodrive(true);
+      break;
+  }
+}
+
+int color_diff(const unsigned char a[3], const unsigned char b[3]) {
+  int diff = 0;
+
+  for (int i = 0; i < 3; i++) {
+    int d = a[i] - b[i];
+    diff += d > 0 ? d : -d;
+  }
+
+  return diff;
+}
+
+double process_camera_image(const unsigned char *image) {
+  int num_pixels = camera_height * camera_width;
+  const unsigned char REF[3] = {95, 187, 203};
+
+  int sumx = 0;
+  int pixel_count = 0;
+
+  const unsigned char *pixel = image;
+  for (int x = 0; x < num_pixels; x++, pixel += 4) {
+    if (color_diff(pixel, REF) < 30) {
+      sumx += x % camera_width;
+      pixel_count++;
+    }
+  }
+
+  if (pixel_count == 0)
+    return UNKNOWN;
+
+  return ((double)sumx / pixel_count / camera_width - 0.5) * camera_fov;
+}
+
+double filter_angle(double new_value) {
+  static bool first_call = true;
+  static double old_value[FILTER_SIZE];
+
+  if (first_call || new_value == UNKNOWN) {
+    first_call = false;
+    for (int i = 0; i < FILTER_SIZE; ++i)
+      old_value[i] = 0.0;
+  } else {
+    for (int i = 0; i < FILTER_SIZE - 1; ++i)
+      old_value[i] = old_value[i + 1];
+  }
+
+  if (new_value == UNKNOWN)
+    return UNKNOWN;
+
+  old_value[FILTER_SIZE - 1] = new_value;
+
+  double sum = 0.0;
+  for (int i = 0; i < FILTER_SIZE; ++i)
+    sum += old_value[i];
+
+  return sum / FILTER_SIZE;
+}
+
+bool process_front_obstacle(const float *sick_data,
+                            double *avg_dist,
+                            double *avg_offset) {
+  int center = sick_width / 2;
+  int count = 0;
+  double dist_sum = 0.0;
+  double offset_sum = 0.0;
+
+  for (int x = center - FRONT_HALF_AREA; x <= center + FRONT_HALF_AREA; x++) {
+    float r = sick_data[x];
+    if (r > 0.01f && r < FRONT_OBSTACLE_DIST) {
+      dist_sum += r;
+      offset_sum += (x - center);
+      count++;
+    }
+  }
+
+  if (count == 0) {
+    *avg_dist = UNKNOWN;
+    *avg_offset = 0.0;
+    return false;
+  }
+
+  *avg_dist = dist_sum / count;
+  *avg_offset = offset_sum / count;
+  return true;
+}
+
+void update_display() {
+  const double NEEDLE_LENGTH = 50.0;
+
+  wb_display_image_paste(display, speedometer_image, 0, 0, false);
+
+  double current_speed = wbu_driver_get_current_speed();
+  if (isnan(current_speed))
+    current_speed = 0.0;
+
+  double alpha = current_speed / 260.0 * 3.72 - 0.27;
+  int x = -NEEDLE_LENGTH * cos(alpha);
+  int y = -NEEDLE_LENGTH * sin(alpha);
+  wb_display_draw_line(display, 100, 95, 100 + x, 95 + y);
+
+  char txt[64];
+  sprintf(txt, "GPS coords: %.1f %.1f", gps_coords[X], gps_coords[Z]);
+  wb_display_draw_text(display, txt, 10, 130);
+
+  sprintf(txt, "GPS speed:  %.1f", gps_speed);
+  wb_display_draw_text(display, txt, 10, 140);
+}
+
+void compute_gps_speed() {
+  const double *coords = wb_gps_get_values(gps);
+  const double speed_ms = wb_gps_get_speed(gps);
+
+  gps_speed = speed_ms * 3.6;
+  memcpy(gps_coords, coords, sizeof(gps_coords));
+}
+
+double applyPID(double yellow_line_angle) {
+  static double oldValue = 0.0;
+  static double integral = 0.0;
+
+  if (PID_need_reset) {
+    oldValue = yellow_line_angle;
+    integral = 0.0;
+    PID_need_reset = false;
+  }
+
+  if (signbit(yellow_line_angle) != signbit(oldValue))
+    integral = 0.0;
+
+  double diff = yellow_line_angle - oldValue;
+
+  if (integral < 30 && integral > -30)
+    integral += yellow_line_angle;
+
+  oldValue = yellow_line_angle;
+
+  return KP * yellow_line_angle + KI * integral + KD * diff;
+}
+
+bool is_pedestrian_model(const char *model) {
+  if (!model)
+    return false;
+
+  return strstr(model, "Pedestrian") != NULL ||
+         strstr(model, "pedestrian") != NULL ||
+         strstr(model, "Human") != NULL ||
+         strstr(model, "human") != NULL;
+}
+
+int main(int argc, char **argv) {
+  wbu_driver_init();
+
+  // Detect available devices
+  for (int j = 0; j < wb_robot_get_number_of_devices(); ++j) {
+    WbDeviceTag device = wb_robot_get_device_by_index(j);
+    const char *name = wb_device_get_name(device);
+
+    if (strcmp(name, "Sick LMS 291") == 0)
+      enable_collision_avoidance = true;
+    else if (strcmp(name, "display") == 0)
+      enable_display = true;
+    else if (strcmp(name, "gps") == 0)
+      has_gps = true;
+    else if (strcmp(name, "camera") == 0)
+      has_camera = true;
+  }
+
+  if (has_camera) {
+    camera = wb_robot_get_device("camera");
+    wb_camera_enable(camera, TIME_STEP);
+    wb_camera_recognition_enable(camera, TIME_STEP);
+    camera_width = wb_camera_get_width(camera);
+    camera_height = wb_camera_get_height(camera);
+    camera_fov = wb_camera_get_fov(camera);
+  }
+
+  if (enable_collision_avoidance) {
+    sick = wb_robot_get_device("Sick LMS 291");
+    wb_lidar_enable(sick, TIME_STEP);
+    sick_width = wb_lidar_get_horizontal_resolution(sick);
+    sick_range = wb_lidar_get_max_range(sick);
+    sick_fov = wb_lidar_get_fov(sick);
+  }
+
+  if (has_gps) {
+    gps = wb_robot_get_device("gps");
+    wb_gps_enable(gps, TIME_STEP);
+  }
+
+  if (enable_display) {
+    display = wb_robot_get_device("display");
+    speedometer_image = wb_display_image_load(display, "speedometer.png");
+  }
+
+  if (has_camera)
+    set_speed(CRUISE_SPEED);
+
+  wbu_driver_set_hazard_flashers(true);
+  wbu_driver_set_dipped_beams(true);
+  wbu_driver_set_antifog_lights(true);
+  wbu_driver_set_wiper_mode(SLOW);
+
+  print_help();
+  wb_keyboard_enable(TIME_STEP);
+
+  while (wbu_driver_step() != -1) {
+    check_keyboard();
+    static int i = 0;
+
+    if (i % (int)(TIME_STEP / wb_robot_get_basic_time_step()) == 0) {
+      const unsigned char *camera_image = NULL;
+      const float *sick_data = NULL;
+
+      if (has_camera)
+        camera_image = wb_camera_get_image(camera);
+
+      if (enable_collision_avoidance)
+        sick_data = wb_lidar_get_range_image(sick);
+
+      if (autodrive && has_camera) {
+        double yellow_line_angle = filter_angle(process_camera_image(camera_image));
+
+        double line_steer = 0.0;
+        if (yellow_line_angle != UNKNOWN)
+          line_steer = applyPID(yellow_line_angle);
+        else
+          PID_need_reset = true;
+
+        double final_steer = line_steer;
+        double target_speed = CRUISE_SPEED;
+
+        bool obstacle_found = false;
+        double obstacle_dist = UNKNOWN;
+        double obstacle_offset = 0.0;
+
+        // LiDAR obstacle avoidance
+        if (enable_collision_avoidance)
+          obstacle_found = process_front_obstacle(
+            sick_data, &obstacle_dist, &obstacle_offset
+          );
+
+        if (obstacle_found) {
+          if (obstacle_offset < 0.0)
+            avoid_direction = 1;
+          else
+            avoid_direction = -1;
+
+          double closeness =
+            (FRONT_OBSTACLE_DIST - obstacle_dist) / FRONT_OBSTACLE_DIST;
+
+          if (closeness < 0.0)
+            closeness = 0.0;
+          if (closeness > 1.0)
+            closeness = 1.0;
+
+          double wanted_bias = avoid_direction * (0.06 + 0.12 * closeness);
+
+          if (wanted_bias > MAX_AVOID_BIAS)
+            wanted_bias = MAX_AVOID_BIAS;
+          if (wanted_bias < -MAX_AVOID_BIAS)
+            wanted_bias = -MAX_AVOID_BIAS;
+
+          avoid_bias = wanted_bias;
+          final_steer = line_steer + avoid_bias;
+          target_speed = AVOID_SPEED;
+          wbu_driver_set_brake_intensity(AVOID_BRAKE);
+        } else {
+          avoid_bias *= RECOVER_FACTOR;
+
+          if (fabs(avoid_bias) < 0.01)
+            avoid_bias = 0.0;
+
+          final_steer = line_steer + avoid_bias;
+          target_speed = CRUISE_SPEED;
+          wbu_driver_set_brake_intensity(0.0);
+        }
+
+        // Lost line fallback
+        if (yellow_line_angle == UNKNOWN) {
+          target_speed = LOST_LINE_SPEED;
+          wbu_driver_set_brake_intensity(LOST_LINE_BRAKE);
+        }
+
+        // Zebra crossing detection
+        if (camera_image) {
+          static bool zebra_active = false;
+          bool zebra_visible = false;
+
+          for (int p = 0; p < camera_height * camera_width; p++) {
+            unsigned char b = camera_image[p * 4];
+            unsigned char g = camera_image[p * 4 + 1];
+            unsigned char r = camera_image[p * 4 + 2];
+            int yellowness = (int)g + (int)r - (int)b * 2;
+
+            if (yellowness > 300) {
+              zebra_visible = true;
+              break;
+            }
+          }
+
+          if (zebra_visible)
+            zebra_active = true;
+
+          if (zebra_active) {
+            if (zebra_visible) {
+              target_speed = 10.0;
+              wbu_driver_set_brake_intensity(0.5);
+            } else {
+              printf("zebra clear - resuming!\n");
+              zebra_active = false;
+              wbu_driver_set_brake_intensity(0.0);
+              PID_need_reset = true;
+            }
+          }
+        }
+
+        // Camera recognition: stop sign / restricted sign logic
+        {
+          static bool stop_sign_active = false;
+
+          int object_count = wb_camera_recognition_get_number_of_objects(camera);
+          const WbCameraRecognitionObject *objects =
+            wb_camera_recognition_get_objects(camera);
+
+          bool stop_sign_seen_now = false;
+
+          for (int k = 0; k < object_count; k++) {
+            const char *model = objects[k].model;
+
+            if (model)
+              printf("Detected object: %s\n", model);
+
+            if (model &&
+                (strstr(model, "order panel") != NULL ||
+                 strstr(model, "stop") != NULL)) {
+              double x_norm =
+                ((double)objects[k].position_on_image[0] / camera_width) - 0.5;
+
+              double size =
+                (double)objects[k].size_on_image[0] / camera_width;
+
+              if (fabs(x_norm) < 0.25 && size > 0.18) {
+                stop_sign_seen_now = true;
+                break;
+              }
+            }
+          }
+
+          if (stop_sign_seen_now)
+            stop_sign_active = true;
+
+          if (stop_sign_active) {
+            target_speed = 0.0;
+            final_steer = line_steer;
+            wbu_driver_set_brake_intensity(1.0);
+
+            if (!stop_sign_seen_now) {
+              stop_sign_active = false;
+              wbu_driver_set_brake_intensity(0.0);
+              PID_need_reset = true;
+              printf("Stop sign cleared - moving again\n");
+            }
+          }
+        }
+
+        // Camera recognition: pedestrian logic
+        {
+          static bool pedestrian_active = false;
+
+          int object_count = wb_camera_recognition_get_number_of_objects(camera);
+          const WbCameraRecognitionObject *objects =
+            wb_camera_recognition_get_objects(camera);
+
+          bool pedestrian_seen_now = false;
+
+          for (int k = 0; k < object_count; k++) {
+            const char *model = objects[k].model;
+
+            if (model)
+              printf("Detected object: %s\n", model);
+
+            if (is_pedestrian_model(model)) {
+              double x_norm =
+                ((double)objects[k].position_on_image[0] / camera_width) - 0.5;
+
+              double size =
+                (double)objects[k].size_on_image[0] / camera_height;
+
+              if (fabs(x_norm) < PEDESTRIAN_CENTER_TOLERANCE && size > 0.18) {
+                pedestrian_seen_now = true;
+                break;
+              }
+            }
+          }
+
+          if (pedestrian_seen_now)
+            pedestrian_active = true;
+
+          if (pedestrian_active) {
+            target_speed = 0.0;
+            final_steer = line_steer;
+            wbu_driver_set_brake_intensity(PEDESTRIAN_STOP_BRAKE);
+
+            if (!pedestrian_seen_now) {
+              pedestrian_active = false;
+              wbu_driver_set_brake_intensity(0.0);
+              PID_need_reset = true;
+              printf("Pedestrian cleared - moving again\n");
+            }
+          }
+        }
+
+        set_speed(target_speed);
+        set_steering_angle(final_steer);
+      }
+
+      if (has_gps)
+        compute_gps_speed();
+
+      if (enable_display)
+        update_display();
+    }
+
+    ++i;
+  }
+
+  wbu_driver_cleanup();
+  return 0;
+}
